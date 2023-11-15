@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+from torch import nn
 import torch.nn.functional as F
+
 from fairscale.nn.model_parallel.layers import (
     ParallelEmbedding,
 )
-from torch import nn
 
 
 @dataclass
@@ -18,9 +19,8 @@ class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
-    n_kv_heads: Optional[int] = None
     vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 128  # make SwiGLU hidden layer size multiple of large power of 2
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
@@ -54,7 +54,6 @@ class RMSNorm(torch.nn.Module):
 
         Returns:
             torch.Tensor: The normalized tensor.
-
         """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -67,7 +66,6 @@ class RMSNorm(torch.nn.Module):
 
         Returns:
             torch.Tensor: The output tensor after applying RMSNorm.
-
         """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
@@ -88,10 +86,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -145,32 +139,18 @@ def apply_rotary_emb(
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(2)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(2)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(1)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(1)
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, None, :]
-        .expand(slen, n_kv_heads, n_rep, head_dim)
-        .reshape(slen, n_kv_heads * n_rep, head_dim)
-    )
 
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -193,31 +173,64 @@ class Attention(nn.Module):
 
         """
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
-        self.n_local_kv_heads = self.n_kv_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
         self.weight_q = nn.Parameter(torch.Tensor(args.dim, args.dim))
         self.weight_k = nn.Parameter(torch.Tensor(args.dim, args.dim))
         self.weight_v = nn.Parameter(torch.Tensor(args.dim, args.dim))
         self.weight_o = nn.Parameter(torch.Tensor(args.dim, args.dim))
-        
-        self.cache_k = torch.zeros(
-            (
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
+
+        temp = self.weight_q.view(
+            self.n_local_heads, self.head_dim, self.n_local_heads, self.head_dim
+        ).transpose(1, 2)
+        self.wq = [
+            [temp[i, j, :] for j in range(self.n_local_heads)]
+            for i in range(self.n_local_heads)
+        ]
+
+        temp = self.weight_k.view(
+            self.n_local_heads, self.head_dim, self.n_local_heads, self.head_dim
+        ).transpose(1, 2)
+        self.wk = [
+            [temp[i, j, :] for j in range(self.n_local_heads)]
+            for i in range(self.n_local_heads)
+        ]
+
+        temp = self.weight_v.view(
+            self.n_local_heads, self.head_dim, self.n_local_heads, self.head_dim
+        ).transpose(1, 2)
+        self.wv = [
+            [temp[i, j, :] for j in range(self.n_local_heads)]
+            for i in range(self.n_local_heads)
+        ]
+
+        temp = self.weight_o.view(
+            self.n_local_heads, self.head_dim, self.n_local_heads, self.head_dim
+        ).transpose(1, 2)
+        self.wo = [
+            [temp[i, j, :] for j in range(self.n_local_heads)]
+            for i in range(self.n_local_heads)
+        ]
+
+        self.cache_k = [
+            torch.zeros(
+                (
+                    args.max_seq_len,
+                    self.head_dim,
+                )
             )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
+            for _ in range(self.n_local_heads)
+        ]
+        self.cache_v = [
+            torch.zeros(
+                (
+                    args.max_seq_len,
+                    self.head_dim,
+                )
             )
-        ).cuda()
+            for _ in range(self.n_local_heads)
+        ]
 
     def forward(
         self,
@@ -240,47 +253,31 @@ class Attention(nn.Module):
 
         """
         seqlen, _ = x.shape
-        
-        x_temp = x.view(seqlen, self.n_local_heads, self.head_dim).transpose(0, 1)
-        weight_q_temp = self.weight_q.view(self.n_local_heads, self.head_dim, self.n_local_heads, self.head_dim).transpose(1, 2)
-        
-        xq_temp = torch.zeros((self.n_local_heads, seqlen, self.head_dim))
-        
-        for head_id in range(self.n_local_heads):
-            for i in range(self.n_local_heads):
-                xq_temp[head_id, :, :] += torch.mm(x_temp[i, :, :], weight_q_temp[i, head_id, :, :])
-        
-        xq, xk, xv = torch.mm(x, self.weight_q), torch.mm(x, self.weight_k), torch.mm(x, self.weight_v)
 
-        xq = xq.view(seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(seqlen, self.n_local_kv_heads, self.head_dim)
+        temp = x.view(seqlen, self.n_local_heads, self.head_dim).transpose(0, 1)
+        x = [temp[i, :, :] for i in range(self.n_local_heads)]
+        output = torch.zeros((self.n_local_heads, seqlen, self.head_dim))
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        for i in range(self.n_local_heads):
+            xq, xk, xv = (torch.zeros((seqlen, self.head_dim)) for _ in range(3))
+            for j in range(self.n_local_heads):
+                xq += torch.mm(x[j], self.wq[j][i])
+                xk += torch.mm(x[j], self.wk[j][i])
+                xv += torch.mm(x[j], self.wv[j][i])
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            self.cache_k[i][start_pos : start_pos + seqlen] = xk
+            self.cache_v[i][start_pos : start_pos + seqlen] = xv
+            key = self.cache_k[i][: start_pos + seqlen]
+            value = self.cache_v[i][: start_pos + seqlen]
+            score = torch.mm(xq, key.transpose(0, 1)) / math.sqrt(self.head_dim)
+            if seqlen > 1:
+                score = score + mask
+            score = F.softmax(score.float(), dim=-1).type_as(xq)
+            qkv = torch.mm(score, value)
+            for j in range(self.n_local_heads):
+                output[j] += torch.mm(qkv, self.wo[i][j])
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[start_pos : start_pos + seqlen] = xk
-        self.cache_v[start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[ : start_pos + seqlen]
-        values = self.cache_v[ : start_pos + seqlen]
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(0, 1)  # (n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(0, 1)
-        values = values.transpose(0, 1)
-        scores = torch.matmul(xq, keys.transpose(1, 2)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (n_local_heads, seqlen, head_dim)
-        output = output.transpose(0, 1).contiguous().view(seqlen, -1)
-        return torch.mm(output, self.weight_o)
+        return output.transpose(0, 1).contiguous().view(seqlen, -1)
 
 
 class FeedForward(nn.Module):
@@ -317,8 +314,64 @@ class FeedForward(nn.Module):
         self.weight_2 = nn.Parameter(torch.Tensor(hidden_dim, dim))
         self.weight_3 = nn.Parameter(torch.Tensor(dim, hidden_dim))
 
+        self.sub_matrix_dim = 128
+
+        self.n_submatrix = dim // self.sub_matrix_dim
+        self.n_hidden_submatrix = hidden_dim // self.sub_matrix_dim
+
+        temp = self.weight_1.view(
+            self.n_submatrix,
+            self.sub_matrix_dim,
+            self.n_hidden_submatrix,
+            self.sub_matrix_dim,
+        ).transpose(1, 2)
+        self.w1 = [
+            [temp[i, j, :] for j in range(self.n_hidden_submatrix)]
+            for i in range(self.n_submatrix)
+        ]
+
+        temp = self.weight_2.view(
+            self.n_hidden_submatrix,
+            self.sub_matrix_dim,
+            self.n_submatrix,
+            self.sub_matrix_dim,
+        ).transpose(1, 2)
+        self.w2 = [
+            [temp[i, j, :] for j in range(self.n_submatrix)]
+            for i in range(self.n_hidden_submatrix)
+        ]
+
+        temp = self.weight_3.view(
+            self.n_submatrix,
+            self.sub_matrix_dim,
+            self.n_hidden_submatrix,
+            self.sub_matrix_dim,
+        ).transpose(1, 2)
+        self.w3 = [
+            [temp[i, j, :] for j in range(self.n_hidden_submatrix)]
+            for i in range(self.n_submatrix)
+        ]
+
     def forward(self, x):
-        return torch.mm(F.silu(torch.mm(x, self.weight_1)) * torch.mm(x, self.weight_3), self.weight_2)
+        seqlen, _ = x.shape
+
+        temp = x.view(seqlen, self.n_submatrix, self.sub_matrix_dim).transpose(0, 1)
+        x = [temp[i, :, :] for i in range(self.n_submatrix)]
+
+        output = torch.zeros((self.n_submatrix, seqlen, self.sub_matrix_dim))
+
+        for i in range(self.n_hidden_submatrix):
+            gate, up = (torch.zeros((seqlen, self.sub_matrix_dim)) for _ in range(2))
+            for j in range(self.n_submatrix):
+                gate += torch.mm(x[j], self.w1[j][i])
+                up += torch.mm(x[j], self.w3[j][i])
+
+            temp = F.silu(gate) * up
+
+            for j in range(self.n_submatrix):
+                output[j] += torch.mm(temp, self.w2[i][j])
+
+        return output.transpose(0, 1).contiguous().view(seqlen, -1)
 
 
 class TransformerBlock(nn.Module):
@@ -422,9 +475,10 @@ class Transformer(nn.Module):
         self.weight_output = nn.Parameter(torch.Tensor(params.dim, params.vocab_size))
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len * 2,
         )
 
     @torch.inference_mode()
@@ -440,7 +494,7 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        seqlen, = tokens.shape
+        (seqlen,) = tokens.shape
         h = self.tok_embeddings(tokens)
         # encrypt
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -448,9 +502,7 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full(
-                (1, seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:

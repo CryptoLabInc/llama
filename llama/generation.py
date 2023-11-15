@@ -6,10 +6,9 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, TypedDict
+from typing import List, Literal, Optional, TypedDict
 
 import torch
-import torch.nn.functional as F
 from fairscale.nn.model_parallel.initialize import (
     get_model_parallel_rank,
     initialize_model_parallel,
@@ -106,14 +105,27 @@ class Llama:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         checkpoint["weight_output"] = torch.transpose(checkpoint["output.weight"], 0, 1)
         for i in range(0, 32):
-            checkpoint[f"layers.{i}.attention.weight_q"] = torch.transpose(checkpoint[f"layers.{i}.attention.wq.weight"], 0, 1)
-            checkpoint[f"layers.{i}.attention.weight_k"] = torch.transpose(checkpoint[f"layers.{i}.attention.wk.weight"], 0, 1)
-            checkpoint[f"layers.{i}.attention.weight_v"] = torch.transpose(checkpoint[f"layers.{i}.attention.wv.weight"], 0, 1)
-            checkpoint[f"layers.{i}.attention.weight_o"] = torch.transpose(checkpoint[f"layers.{i}.attention.wo.weight"], 0, 1)
-            checkpoint[f"layers.{i}.feed_forward.weight_1"] = torch.transpose(checkpoint[f"layers.{i}.feed_forward.w1.weight"], 0, 1)
-            checkpoint[f"layers.{i}.feed_forward.weight_2"] = torch.transpose(checkpoint[f"layers.{i}.feed_forward.w2.weight"], 0, 1)
-            checkpoint[f"layers.{i}.feed_forward.weight_3"] = torch.transpose(checkpoint[f"layers.{i}.feed_forward.w3.weight"], 0, 1)
-            
+            checkpoint[f"layers.{i}.attention.weight_q"] = torch.transpose(
+                checkpoint[f"layers.{i}.attention.wq.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.attention.weight_k"] = torch.transpose(
+                checkpoint[f"layers.{i}.attention.wk.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.attention.weight_v"] = torch.transpose(
+                checkpoint[f"layers.{i}.attention.wv.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.attention.weight_o"] = torch.transpose(
+                checkpoint[f"layers.{i}.attention.wo.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.feed_forward.weight_1"] = torch.transpose(
+                checkpoint[f"layers.{i}.feed_forward.w1.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.feed_forward.weight_2"] = torch.transpose(
+                checkpoint[f"layers.{i}.feed_forward.w2.weight"], 0, 1
+            )
+            checkpoint[f"layers.{i}.feed_forward.weight_3"] = torch.transpose(
+                checkpoint[f"layers.{i}.feed_forward.w3.weight"], 0, 1
+            )
 
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
@@ -142,7 +154,7 @@ class Llama:
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-    ) :
+    ):
         """
         Generate text sequences based on provided prompts using the language generation model.
 
@@ -169,8 +181,10 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        token = torch.full((total_len, ), pad_id, dtype=torch.long, device="cuda")
-        token[ : len(prompt_token)] = torch.tensor(prompt_token, dtype=torch.long, device="cuda")
+        token = torch.full((total_len,), pad_id, dtype=torch.long, device="cuda")
+        token[: len(prompt_token)] = torch.tensor(
+            prompt_token, dtype=torch.long, device="cuda"
+        )
 
         prev_pos = 0
         eos_reached = False
@@ -192,10 +206,14 @@ class Llama:
             )
             prev_pos = cur_pos
             if cur_pos == prompt_len:
-                print(f"Summerization Stage(gen 1st tok): {time.time() - start_time:.2f}s")
+                print(
+                    f"Summerization Stage(gen 1st tok): {time.time() - start_time:.2f}s"
+                )
             if eos_reached:
-                print(f"\nGeneration Stage(gen 2~ tok): {time.time() - start_time:.2f}s")
-            
+                print(
+                    f"\nGeneration Stage(gen 2~ tok): {time.time() - start_time:.2f}s"
+                )
+
             print(self.tokenizer.decode(next_token.tolist()[0]), end="")
             if eos_reached:
                 break
@@ -206,7 +224,7 @@ class Llama:
         temperature: float = 0.6,
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
-    ) :
+    ):
         """
         Generate assistant responses for a list of conversational dialogs using the language generation model.
 
