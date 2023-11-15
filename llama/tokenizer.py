@@ -55,7 +55,7 @@ class Tokenizer:
             t = t + [self.eos_id]
         return t
 
-    def decode(self, t: List[int]) -> str:
+    def decode(self, t: int) -> str:
         """
         Decodes a list of token IDs into a string.
 
@@ -65,4 +65,4 @@ class Tokenizer:
         Returns:
             str: The decoded string.
         """
-        return self.sp_model.decode(t)
+        return str(self.sp_model.IdToPiece(t)).replace("▁", " ").replace("<0x0A>", "\n")
