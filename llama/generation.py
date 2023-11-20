@@ -215,7 +215,7 @@ class Llama:
                 )
 
             print(self.tokenizer.decode(next_token.tolist()[0]), end="")
-            if eos_reached:
+            if eos_reached or True:
                 break
 
     def chat_completion(

@@ -13,6 +13,8 @@ from fairscale.nn.model_parallel.layers import (
     ParallelEmbedding,
 )
 
+from export_libtorch import Container
+
 
 @dataclass
 class ModelArgs:
@@ -505,8 +507,15 @@ class Transformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
+        input = torch.tensor(h)
+        in_out = {"input": input.to("cpu")}
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+            output = torch.tensor(h)
+            in_out["output"] = output.to("cpu")
+            container = torch.jit.script(Container(in_out))
+            container.save("transformer_in_out.pt")
+            break
         h = self.norm(h)
 
         return torch.mm(h, self.weight_output).float()
